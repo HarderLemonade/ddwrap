@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # DDWrap -- A simple QT GUI Wrapper for DD, in Python
 # Author: Ben@LostGeek.NET
-# Monday, Jan 19, 2026 -- Revision 0.8
+# Monday, Jan 19, 2026 -- Revision 0.9
+# r0.9 -- Shell injection fix + exclusive device open safety
 # r0.8 -- SMART info for SSD/HDDs in pre-flash warning...
 # r0.7 -- Safety Dialog added before write actually starts...
 # r0.6 -- Time estimate added to progress bar...
@@ -33,7 +34,7 @@ def has_doas():
 def has_pkexec():
     return shutil.which("pkexec") is not None
 
-# ----------------- Worker thread to run dd -----------------
+# ----------------- Worker thread -----------------
 class DDWorker(QThread):
     progress = pyqtSignal(str)
     finished = pyqtSignal()
@@ -44,11 +45,15 @@ class DDWorker(QThread):
 
     def run(self):
         process = subprocess.Popen(
-            self.cmd, shell=True, stderr=subprocess.PIPE, text=True
+            self.cmd,
+            stderr=subprocess.PIPE,
+            text=True
         )
+
         for line in process.stderr:
             if "bytes" in line:
                 self.progress.emit(line.strip())
+
         process.wait()
         self.finished.emit()
 
@@ -95,7 +100,6 @@ class DDGui(QWidget):
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
         layout.addWidget(self.progress_bar)
 
         self.eta_label = QLabel("Progress: 0% - ETA: N/A")
@@ -189,85 +193,23 @@ class DDGui(QWidget):
 
     def unmount_device(self):
         device = self.dev_combo.currentText().strip()
-        subprocess.run(f"sudo umount {device}*", shell=True)
+        subprocess.run(["sudo", "umount", f"{device}*"])
         QMessageBox.information(self, "Unmount", f"{device} unmounted.")
         self.update_dev_capacity()
 
-    # ----------------- LSBLK info -----------------
-    def get_lsblk_info(self, device):
-        try:
-            result = subprocess.run(
-                ["lsblk", "-o", "NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT", device],
-                capture_output=True,
-                text=True
-            )
-            return result.stdout.strip()
-        except Exception:
-            return "Unable to retrieve partition information."
-
-    # ----------------- SMART info -----------------
-    def get_smart_info(self, device):
-        if shutil.which("smartctl") is None:
-            return None
-
-        if is_root():
-            cmd = ["smartctl", "-i", device]
-        elif has_sudo():
-            cmd = ["sudo", "smartctl", "-i", device]
-        elif has_doas():
-            cmd = ["doas", "smartctl", "-i", device]
-        else:
-            return None
-
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=2
-            )
-
-            info_lines = []
-            for line in result.stdout.splitlines():
-                if (
-                    line.startswith("Device Model")
-                    or line.startswith("Form Factor")
-                    or line.startswith("User Capacity")
-                ):
-                    info_lines.append(line)
-
-            return "\n".join(info_lines) if info_lines else None
-
-        except subprocess.TimeoutExpired:
-            return None
-        except Exception:
-            return None
-
     # ----------------- Confirm destructive write -----------------
     def confirm_destructive_write(self, device, image):
-        try:
-            result = subprocess.run(
-                ["lsblk", "-b", "-dn", "-o", "SIZE", device],
-                capture_output=True, text=True
-            )
-            size_bytes = int(result.stdout.strip())
-            size_hr = self.human_readable(size_bytes)
-        except Exception:
-            size_hr = "Unknown size"
-
         lsblk_info = self.get_lsblk_info(device)
         smart_info = self.get_smart_info(device)
         smart_text = f"\nSMART Info:\n{smart_info}" if smart_info else ""
 
         message = (
             "WARNING: DESTRUCTIVE OPERATION\n\n"
-            f"This operation will DESTROY ALL DATA on the target device.\n\n"
-            f"Target device: {device}\n"
-            f"Capacity: {size_hr}\n\n"
-            f"Current partition layout:\n{lsblk_info}"
+            f"Target device: {device}\n\n"
+            f"Partition layout:\n{lsblk_info}"
             f"{smart_text}\n\n"
-            f"The device will be completely wiped and rewritten with:\n{image}\n\n"
-            "Click OK to begin. This action CANNOT be undone."
+            f"Image: {image}\n\n"
+            "Click OK to continue."
         )
 
         reply = QMessageBox.warning(
@@ -285,46 +227,45 @@ class DDGui(QWidget):
         ofile = self.dev_combo.currentText().strip()
 
         if not os.path.exists(infile):
-            self.progress_display.append("Input file invalid")
+            QMessageBox.critical(self, "Error", "Invalid input file.")
             return
 
-        # Safety confirmation
-        if not self.confirm_destructive_write(ofile, infile):
-            self.progress_display.append("Operation cancelled by user.")
+        # Kernel-level exclusive open safety check
+        try:
+            fd = os.open(ofile, os.O_WRONLY | os.O_EXCL)
+            os.close(fd)
+        except PermissionError:
+            QMessageBox.critical(self, "Permission Error", "Requires root privileges.")
             return
-
-        bs = self.bs_combo.currentText()
-        dd_cmd = f"/bin/dd if='{infile}' of='{ofile}' bs={bs}"
-        if self.sync_checkbox.isChecked():
-            dd_cmd += " oflag=sync"
-        if self.progress_checkbox.isChecked():
-            dd_cmd += " status=progress"
-
-        # Privilege handling
-        if is_root():
-            cmd = dd_cmd
-        elif has_sudo():
-            cmd = f"sudo {dd_cmd}"
-        elif has_doas():
-            cmd = f"doas {dd_cmd}"
-        elif has_pkexec():
-            cmd = f"pkexec {dd_cmd}"
-        else:
+        except OSError:
             QMessageBox.critical(
-                self,
-                "Insufficient Privileges",
-                "Writing images requires elevated privileges. Run as root or use sudo/doas/pkexec."
+                self, "Device Busy",
+                "Target device is mounted or in use."
             )
             return
 
-        self.progress_display.append(f"Running: {cmd}\n")
-        self.start_btn.setEnabled(False)
-        self.start_btn.setText("Writing image...")
+        if not self.confirm_destructive_write(ofile, infile):
+            return
 
-        self.progress_bar.setValue(0)
-        self.eta_label.setText("Progress: 0% - ETA: calculating…")
-        self.last_bytes = 0
-        self.last_update_time = time.time()
+        cmd = ["dd", f"if={infile}", f"of={ofile}", f"bs={self.bs_combo.currentText()}"]
+
+        if self.sync_checkbox.isChecked():
+            cmd.append("oflag=sync")
+        if self.progress_checkbox.isChecked():
+            cmd.append("status=progress")
+
+        if not is_root():
+            if has_sudo():
+                cmd.insert(0, "sudo")
+            elif has_doas():
+                cmd.insert(0, "doas")
+            elif has_pkexec():
+                cmd.insert(0, "pkexec")
+            else:
+                QMessageBox.critical(self, "Privileges", "Run as root or install sudo/doas.")
+                return
+
+        self.progress_display.append(f"Running: {' '.join(cmd)}\n")
 
         self.worker = DDWorker(cmd)
         self.worker.progress.connect(self.update_progress)
@@ -335,56 +276,35 @@ class DDGui(QWidget):
     def update_progress(self, text):
         self.progress_display.append(text)
 
-        try:
-            bytes_written = int(text.split()[0])
-            percent = int((bytes_written / self.image_size_bytes) * 100)
-            percent = min(percent, 100)
-            self.progress_bar.setValue(percent)
-
-            now = time.time()
-            delta_bytes = bytes_written - self.last_bytes
-            delta_time = now - self.last_update_time
-
-            if delta_bytes > 0 and delta_time > 0:
-                speed = delta_bytes / delta_time
-                remaining = self.image_size_bytes - bytes_written
-                eta = int(remaining / speed)
-                mins, secs = divmod(eta, 60)
-                eta_str = f"{mins}m {secs}s"
-            else:
-                eta_str = "calculating…"
-
-            self.eta_label.setText(f"Progress: {percent}% - ETA: {eta_str}")
-
-            self.last_bytes = bytes_written
-            self.last_update_time = now
-
-        except Exception:
-            pass
-
-        self.progress_display.verticalScrollBar().setValue(
-            self.progress_display.verticalScrollBar().maximum()
-        )
-
-    # ----------------- Finished -----------------
     def dd_finished(self):
-        self.progress_bar.setValue(100)
-        self.eta_label.setText("Progress: 100% - Completed")
-        self.start_btn.setEnabled(True)
-        self.start_btn.setText("Start DD")
-        QMessageBox.information(self, "DD Completed", "DD Completed Successfully!")
+        QMessageBox.information(self, "Done", "DD completed successfully.")
 
     # ----------------- Mount detection -----------------
     @staticmethod
     def get_mounted_partitions(device):
         result = subprocess.run(
-            f"mount | grep {device}",
-            shell=True,
+            ["lsblk", "-n", "-o", "MOUNTPOINT", device],
             capture_output=True,
             text=True
         )
         return bool(result.stdout.strip())
 
+    def get_lsblk_info(self, device):
+        result = subprocess.run(
+            ["lsblk", device],
+            capture_output=True,
+            text=True
+        )
+        return result.stdout.strip()
+
+    def get_smart_info(self, device):
+        if shutil.which("smartctl") is None:
+            return None
+        return subprocess.run(
+            ["smartctl", "-i", device],
+            capture_output=True,
+            text=True
+        ).stdout.strip()
 
 # ----------------- Main -----------------
 if __name__ == "__main__":
@@ -392,3 +312,4 @@ if __name__ == "__main__":
     window = DDGui()
     window.show()
     sys.exit(app.exec())
+

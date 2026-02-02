@@ -23,6 +23,12 @@ DDWrap provides a graphical interface around `dd` that allows you to:
 
 Under the hood, DDWrap still runs `dd`. Nothing is hidden.
 
+### DDWrap in Action
+
+![DDWrap writing an image with progress and ETA](ddwrap.png)
+
+The screenshot above shows DDWrap actively writing an image to a USB device, with real-time progress output, percentage complete, and estimated time remaining.
+
 ---
 
 ## Why It Exists
@@ -55,6 +61,12 @@ Before any write begins, DDWrap:
 - Shows the **current partition layout**
 - Displays **SMART device information** (when available)
 - Requires explicit confirmation before starting
+
+### Pre-Write Safety Confirmation
+
+![Destructive write confirmation dialog with SMART data](ddwrap-smwarn.png)
+
+Before the write begins, DDWrap presents a final confirmation dialog showing the target device, capacity, partition layout, and SMART information (when available). This is the user’s last chance to verify that the correct device has been selected.
 
 You can still wipe the wrong disk if you ignore the warnings.  
 That is intentional. You must know your system.
@@ -129,6 +141,6 @@ DDWrap makes `dd` easier to use — not safer to ignore.
 If you use this tool:
 - Verify the target device
 - Read the confirmation dialog
-- Pay attention: If you need to umount the target, DOUBLE check that it isn't your game library or media collection on a second HDD...
+- Pay attention: If you need to unmount the target, **double-check** that it isn’t your game library or media collection on a secondary HDD.
 
-`dd` can be dangerous, so use with care.
+`dd` can be dangerous. Use with care.

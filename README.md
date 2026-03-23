@@ -89,6 +89,8 @@ NVMe devices (`/dev/nvme*`) are **not detected by default**, by design.
 DDWrap is focused on removable media, where accidental overwrites of primary system disks are **less likely**.  
 Advanced users may modify device detection logic if desired.
 
+-- UPDATE 03/22/2026 we are now just blocking rootfs, efi, home and other important mounts, but nvme devices should show up as you may potentially want to write images to them.
+
 ---
 
 ## Requirements

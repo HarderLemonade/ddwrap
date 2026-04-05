@@ -73,23 +73,30 @@ That is intentional. You must know your system.
 
 ---
 
-## Device Scope (By Design)
+## Disclaimer
 
-DDWrap intentionally detects **traditional `/dev/sdX` devices** only.
+DDWrap is provided **as-is**, with **no warranty or guarantee** of any kind.
 
-This includes:
-- USB flash drives
-- USB hard disks
-- USB SSDs
+If you use it, you do so **at your own risk**. You are responsible for verifying the target device, the source image, and the consequences of running `dd`.
 
-### NVMe Devices
+This project was developed with assistance from **artificial intelligence tools**. The goal was to improve clarity, safety, and overall quality. Final decisions, testing, and release responsibility remain with the project author.
 
-NVMe devices (`/dev/nvme*`) are **not detected by default**, by design.
+---
 
-DDWrap is focused on removable media, where accidental overwrites of primary system disks are **less likely**.  
-Advanced users may modify device detection logic if desired.
+## Device Scope
 
--- UPDATE 03/22/2026 we are now just blocking rootfs, efi, home and other important mounts, but nvme devices should show up as you may potentially want to write images to them.
+By default, DDWrap shows removable or hotplug whole-disk devices, which keeps the normal path focused on USB sticks, USB SSDs, USB hard drives, and similar media that users are likely to image.
+
+Mounted removable media is still listed, so it can be unmounted from inside DDWrap before writing.
+
+Advanced users can enable **Show internal disks** to reveal other whole-disk devices that `lsblk` reports, except for disks that back core mounted filesystems such as:
+
+- `/`
+- `/home`
+- `/boot`
+- `/boot/efi`
+
+Even with that advanced toggle, the confirmation dialog remains the last safety check. Always verify the exact target device before writing.
 
 ---
 
@@ -119,6 +126,7 @@ These enhance functionality but are **not required**.
   - Used only to display informational SMART data. If not installed, the feature simply won't be used.
 - **Privilege escalation**
   - `sudo`, `doas`, or `pkexec`
+  - In graphical desktop sessions, DDWrap prefers `pkexec` when available so authentication can happen without requiring a terminal.
 
 If you do not have doas/sudo configured and installed, DDWrap must simply be run as root.
 

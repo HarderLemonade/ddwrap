@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # DDWrap -- A simple QT GUI Wrapper for DD, in Python
 # Author: Ben @ LostGeek.NET
-# Sunday, Mar 22, 2026 -- Version r0.90
-# r0.90 -- Debian packaging added, safer dd exec, device-in-use checks fixed...
+# Sunday, Apr 05, 2026 -- Version r0.92
+# r0.92 -- Refactoring, putting the general "polish" on .90
+# r0.90 -- Debian packaging added (not part of git repo), safer dd exec, device-in-use checks fixed...
 # r0.8 -- SMART info for SSD/HDDs in pre-flash warning...
 # r0.7 -- Safety Dialog added before write actually starts...
 # r0.6 -- Time estimate added to progress bar...
@@ -35,9 +36,26 @@ def has_doas():
 def has_pkexec():
     return shutil.which("pkexec") is not None
 
+
+def in_graphical_session():
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def has_passwordless_sudo():
+    if not has_sudo() or is_root():
+        return False
+
+    result = subprocess.run(
+        ["sudo", "-n", "true"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    return result.returncode == 0
+
 # ----------------- Worker thread to run dd -----------------
 class DDWorker(QThread):
     progress = pyqtSignal(str)
+    error = pyqtSignal(str)
     finished = pyqtSignal(int)
 
     def __init__(self, cmd):
@@ -45,18 +63,29 @@ class DDWorker(QThread):
         self.cmd = cmd
 
     def run(self):
-        process = subprocess.Popen(
-            self.cmd, stderr=subprocess.PIPE, text=True
-        )
+        env = os.environ.copy()
+        env["LC_ALL"] = "C"
+
+        try:
+            process = subprocess.Popen(
+                self.cmd, stderr=subprocess.PIPE, text=True, env=env
+            )
+        except OSError as exc:
+            self.error.emit(str(exc))
+            self.finished.emit(1)
+            return
+
         for line in process.stderr:
             if "bytes" in line:
                 self.progress.emit(line.strip())
+
         returncode = process.wait()
         self.finished.emit(returncode)
 
 # ----------------- Main GUI -----------------
 class DDGui(QWidget):
     PROTECTED_MOUNTPOINTS = {"/", "/home", "/boot", "/boot/efi"}
+    REMOVABLE_TRANSPORTS = {"usb", "firewire", "mmc"}
 
     def __init__(self):
         super().__init__()
@@ -78,6 +107,7 @@ class DDGui(QWidget):
         top_layout.addWidget(QLabel("Input File:"))
         h_input = QHBoxLayout()
         self.input_edit = QLineEdit()
+        self.input_edit.textChanged.connect(self.on_input_changed)
         h_input.addWidget(self.input_edit)
         browse_btn = QPushButton("Browse")
         browse_btn.clicked.connect(self.browse_file)
@@ -123,6 +153,10 @@ class DDGui(QWidget):
         h_dev.addWidget(self.unmount_btn)
         bottom_layout.addLayout(h_dev)
 
+        self.advanced_devices_checkbox = QCheckBox("Show internal disks")
+        self.advanced_devices_checkbox.toggled.connect(self.refresh_devices)
+        bottom_layout.addWidget(self.advanced_devices_checkbox)
+
         # ----------------- Flags -----------------
         self.sync_checkbox = QCheckBox("oflag=sync  (Default)")
         self.sync_checkbox.setChecked(True)
@@ -157,6 +191,15 @@ class DDGui(QWidget):
             f"File Size: {self.human_readable(self.image_size_bytes)}"
         )
 
+    def on_input_changed(self, path):
+        path = path.strip()
+        if os.path.isfile(path):
+            self.show_file_size(path)
+            return
+
+        self.image_size_bytes = 0
+        self.file_size_label.setText("File Size: N/A")
+
     @staticmethod
     def human_readable(num, suffix="B"):
         for unit in ["", "K", "M", "G", "T"]:
@@ -169,6 +212,13 @@ class DDGui(QWidget):
     def privilege_prefix():
         if is_root():
             return []
+
+        if has_passwordless_sudo():
+            return ["sudo"]
+
+        # Desktop launches are more likely to have a PolicyKit agent than a tty.
+        if in_graphical_session() and has_pkexec():
+            return ["pkexec"]
         if has_sudo():
             return ["sudo"]
         if has_doas():
@@ -182,16 +232,57 @@ class DDGui(QWidget):
         prefix = DDGui.privilege_prefix()
         if prefix is None:
             raise PermissionError("No privilege escalation helper is available.")
-        return subprocess.run(prefix + args, **kwargs)
+
+        env = kwargs.pop("env", os.environ.copy())
+        env["LC_ALL"] = "C"
+        return subprocess.run(prefix + args, env=env, **kwargs)
+
+    @staticmethod
+    def run_command(args, **kwargs):
+        env = kwargs.pop("env", os.environ.copy())
+        env["LC_ALL"] = "C"
+        return subprocess.run(args, env=env, **kwargs)
 
     @staticmethod
     def get_lsblk_json(device=None):
-        cmd = ["lsblk", "-J", "-o", "PATH,NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS"]
-        if device:
-            cmd.append(device)
+        column_sets = [
+            "PATH,NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS,RM,HOTPLUG,TRAN",
+            "PATH,NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS,RM,TRAN",
+            "PATH,NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,RM,TRAN",
+        ]
 
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        return json.loads(result.stdout)
+        last_error = None
+        for columns in column_sets:
+            cmd = ["lsblk", "-J", "-o", columns]
+            if device:
+                cmd.append(device)
+
+            try:
+                result = DDGui.run_command(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                data = json.loads(result.stdout)
+                for entry in data.get("blockdevices", []):
+                    DDGui.normalize_lsblk_entry(entry)
+                return data
+            except (subprocess.CalledProcessError, json.JSONDecodeError) as exc:
+                last_error = exc
+
+        raise last_error or RuntimeError("Unable to query lsblk.")
+
+    @staticmethod
+    def normalize_lsblk_entry(entry):
+        if "mountpoints" not in entry:
+            mountpoint = entry.get("mountpoint")
+            entry["mountpoints"] = [mountpoint] if mountpoint else []
+
+        for child in entry.get("children", []):
+            DDGui.normalize_lsblk_entry(child)
+
+        return entry
 
     @staticmethod
     def flatten_lsblk_devices(entries):
@@ -211,12 +302,22 @@ class DDGui(QWidget):
                     return True
         return False
 
+    @classmethod
+    def is_removable_device(cls, entry):
+        transport = (entry.get("tran") or "").lower()
+        return (
+            bool(entry.get("rm"))
+            or bool(entry.get("hotplug"))
+            or transport in cls.REMOVABLE_TRANSPORTS
+        )
+
     # ----------------- Devices -----------------
     def refresh_devices(self):
         self.dev_combo.clear()
 
         try:
             lsblk = self.get_lsblk_json()
+            show_advanced = self.advanced_devices_checkbox.isChecked()
             devices = [
                 entry["path"]
                 for entry in lsblk.get("blockdevices", [])
@@ -224,6 +325,10 @@ class DDGui(QWidget):
                     entry.get("type") == "disk"
                     and entry.get("path")
                     and not self.device_has_protected_mounts(entry)
+                    and (
+                        show_advanced
+                        or self.is_removable_device(entry)
+                    )
                 )
             ]
         except Exception:
@@ -232,14 +337,22 @@ class DDGui(QWidget):
         self.dev_combo.addItems(devices)
         if devices:
             self.update_dev_capacity()
+            return
+
+        self.dev_size_label.setText("Device Capacity: N/A")
+        self.start_btn.setEnabled(False)
+        self.unmount_btn.setEnabled(False)
 
     def update_dev_capacity(self):
         device = self.dev_combo.currentText().strip()
         if not device:
+            self.dev_size_label.setText("Device Capacity: N/A")
+            self.start_btn.setEnabled(False)
+            self.unmount_btn.setEnabled(False)
             return
 
         try:
-            result = subprocess.run(
+            result = self.run_command(
                 ["lsblk", "-b", "-dn", "-o", "SIZE", device],
                 capture_output=True,
                 text=True,
@@ -293,7 +406,7 @@ class DDGui(QWidget):
     # ----------------- LSBLK info -----------------
     def get_lsblk_info(self, device):
         try:
-            result = subprocess.run(
+            result = self.run_command(
                 ["lsblk", "-o", "NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT", device],
                 capture_output=True,
                 text=True,
@@ -308,18 +421,9 @@ class DDGui(QWidget):
         if shutil.which("smartctl") is None:
             return None
 
-        if is_root():
-            cmd = ["smartctl", "-i", device]
-        elif has_sudo():
-            cmd = ["sudo", "smartctl", "-i", device]
-        elif has_doas():
-            cmd = ["doas", "smartctl", "-i", device]
-        else:
-            return None
-
         try:
-            result = subprocess.run(
-                cmd,
+            result = self.run_command(
+                ["smartctl", "-i", device],
                 capture_output=True,
                 text=True,
                 timeout=2
@@ -383,7 +487,7 @@ class DDGui(QWidget):
     # ----------------- Confirm destructive write -----------------
     def confirm_destructive_write(self, device, image):
         try:
-            result = subprocess.run(
+            result = self.run_command(
                 ["lsblk", "-b", "-dn", "-o", "SIZE", device],
                 capture_output=True, text=True
             )
@@ -421,7 +525,7 @@ class DDGui(QWidget):
         infile = self.input_edit.text().strip()
         ofile = self.dev_combo.currentText().strip()
 
-        if not os.path.exists(infile):
+        if not os.path.isfile(infile):
             self.progress_display.append("Input file invalid")
             return
 
@@ -462,7 +566,16 @@ class DDGui(QWidget):
             return
 
         bs = self.bs_combo.currentText()
-        dd_cmd = ["/bin/dd", f"if={infile}", f"of={ofile}", f"bs={bs}"]
+        dd_path = shutil.which("dd")
+        if dd_path is None:
+            QMessageBox.critical(
+                self,
+                "Missing Dependency",
+                "GNU dd was not found in PATH."
+            )
+            return
+
+        dd_cmd = [dd_path, f"if={infile}", f"of={ofile}", f"bs={bs}"]
         if self.sync_checkbox.isChecked():
             dd_cmd.append("oflag=sync")
         if self.progress_checkbox.isChecked():
@@ -491,8 +604,12 @@ class DDGui(QWidget):
 
         self.worker = DDWorker(cmd)
         self.worker.progress.connect(self.update_progress)
+        self.worker.error.connect(self.handle_worker_error)
         self.worker.finished.connect(self.dd_finished)
         self.worker.start()
+
+    def handle_worker_error(self, message):
+        self.progress_display.append(f"Failed to start dd: {message}")
 
     # ----------------- Progress update -----------------
     def update_progress(self, text):
